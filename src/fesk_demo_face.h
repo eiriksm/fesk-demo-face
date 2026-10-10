@@ -35,9 +35,14 @@
  *
  * - LIGHT long press: Cycle mode (what gets transmitted):
  *     TEST - a built-in test message.
- *     FILE - the contents of the file "test" on the filesystem (like
- *            `cat test`). Create it with e.g. `echo hello > test`.
- *            Shows NOFILE if it does not exist.
+ *     LS   - the names of all files on the filesystem, separated by
+ *            spaces (like `ls`).
+ *     FILE - the contents of one file (like `cat <file>`). The display
+ *            shows the first six characters of its name. LIGHT short
+ *            press selects the next file, wrapping around after the last
+ *            one. FILE is skipped when there are no files.
+ *   LS and FILE show NOFILE instead of transmitting if there is nothing to
+ *   send.
  *
  * - ALARM long press: Play debug melody. This can be used to see if your
  *   receiver is getting similar frequencies as we are expecting it to be.

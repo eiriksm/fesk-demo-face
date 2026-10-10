@@ -32,13 +32,16 @@
 #include "movement.h"
 #include "watch.h"
 #include "watch_tcc.h"
+#include "lfs.h"
 
-#define FESK_DEMO_FILENAME "test"
+extern lfs_t eeprom_filesystem;
+
 #define FESK_DEMO_MAX_FILE_SIZE 1024
 
 typedef enum {
     FESK_DEMO_MODE_TEST = 0,    // Transmit the built-in test message
-    FESK_DEMO_MODE_FILE,        // Transmit the contents of FESK_DEMO_FILENAME
+    FESK_DEMO_MODE_LS,          // Transmit the names of all files
+    FESK_DEMO_MODE_FILE,        // Transmit the contents of the selected file
     FESK_DEMO_MODE_COUNT
 } fesk_demo_mode_t;
 
@@ -50,19 +53,75 @@ typedef struct {
     bool is_debug_playing;
     uint8_t led_color;  // 0 = no LED, 1 = red, 2 = green
     fesk_demo_mode_t mode;
-    char *file_buffer;  // Contents of FESK_DEMO_FILENAME while in FILE mode
+    uint8_t file_index; // Which file FILE mode transmits, in directory order
+    char *file_buffer;  // Payload built for LS or FILE mode while transmitting
 } fesk_demo_state_t;
 
 static const char test_message[] = "test 😎";
 
 static fesk_demo_state_t *sequence_callback_state = NULL;
 
+// Finds the index-th regular file in the root directory. Returns false if
+// there are not that many files.
+static bool _fesk_demo_get_file(uint8_t index, struct lfs_info *info) {
+    lfs_dir_t dir;
+    if (lfs_dir_open(&eeprom_filesystem, &dir, "/") < 0) return false;
+
+    bool found = false;
+    uint8_t count = 0;
+    while (lfs_dir_read(&eeprom_filesystem, &dir, info) > 0) {
+        if (info->type != LFS_TYPE_REG) continue;
+        if (count++ == index) {
+            found = true;
+            break;
+        }
+    }
+    lfs_dir_close(&eeprom_filesystem, &dir);
+    return found;
+}
+
 static void _fesk_demo_display_ready(fesk_demo_state_t *state) {
-    watch_display_text_with_fallback(WATCH_POSITION_TOP, "FESK", "FK");
+    struct lfs_info info;
+    char name[7];
+
+    switch (state->mode) {
+        case FESK_DEMO_MODE_LS:
+            watch_display_text_with_fallback(WATCH_POSITION_TOP, "FESK", "FK");
+            watch_display_text(WATCH_POSITION_BOTTOM, "  LS  ");
+            break;
+        case FESK_DEMO_MODE_FILE:
+            // Show the first six characters of the selected file's name.
+            watch_display_text_with_fallback(WATCH_POSITION_TOP, "FILE", "FI");
+            if (_fesk_demo_get_file(state->file_index, &info)) {
+                snprintf(name, sizeof(name), "%-6.6s", info.name);
+                watch_display_text(WATCH_POSITION_BOTTOM, name);
+            } else {
+                watch_display_text(WATCH_POSITION_BOTTOM, "NOFILE");
+            }
+            break;
+        default:
+            watch_display_text_with_fallback(WATCH_POSITION_TOP, "FESK", "FK");
+            watch_display_text(WATCH_POSITION_BOTTOM, " TEST ");
+            break;
+    }
+}
+
+// In FILE mode, selects the next file, wrapping around after the last one.
+static void _fesk_demo_next_file(fesk_demo_state_t *state) {
+    struct lfs_info info;
+    state->file_index++;
+    if (!_fesk_demo_get_file(state->file_index, &info)) state->file_index = 0;
+}
+
+// LIGHT long press steps TEST -> LS -> FILE -> TEST.
+static void _fesk_demo_next_mode(fesk_demo_state_t *state) {
+    struct lfs_info info;
+
+    state->mode = (state->mode + 1) % FESK_DEMO_MODE_COUNT;
     if (state->mode == FESK_DEMO_MODE_FILE) {
-        watch_display_text(WATCH_POSITION_BOTTOM, " FILE ");
-    } else {
-        watch_display_text(WATCH_POSITION_BOTTOM, " TEST ");
+        state->file_index = 0;
+        // Skip FILE mode entirely when there are no files.
+        if (!_fesk_demo_get_file(0, &info)) state->mode = FESK_DEMO_MODE_TEST;
     }
 }
 
@@ -73,21 +132,48 @@ static void _fesk_demo_free_file_buffer(fesk_demo_state_t *state) {
     }
 }
 
-// Like `cat test`: read the whole file so it can be transmitted.
-static fesk_result_t _fesk_demo_provide_payload(const char **out_text,
-                                                size_t *out_length,
-                                                void *user_data) {
-    fesk_demo_state_t *state = (fesk_demo_state_t *)user_data;
-
-    if (state->mode != FESK_DEMO_MODE_FILE) {
-        *out_text = test_message;
-        *out_length = 0;
-        return FESK_OK;
+// Like `ls`: the names of all files, separated by spaces. Names that would
+// push the list past FESK_DEMO_MAX_FILE_SIZE are left out.
+static fesk_result_t _fesk_demo_build_ls(fesk_demo_state_t *state,
+                                         const char **out_text,
+                                         size_t *out_length) {
+    state->file_buffer = malloc(FESK_DEMO_MAX_FILE_SIZE + 1);
+    if (!state->file_buffer) {
+        return FESK_ERR_ALLOCATION_FAILED;
     }
 
-    _fesk_demo_free_file_buffer(state);
+    size_t length = 0;
+    struct lfs_info info;
+    for (uint8_t i = 0; _fesk_demo_get_file(i, &info); i++) {
+        size_t name_length = strlen(info.name);
+        size_t needed = name_length + (length > 0 ? 1 : 0);
+        if (length + needed > FESK_DEMO_MAX_FILE_SIZE) break;
+        if (length > 0) state->file_buffer[length++] = ' ';
+        memcpy(state->file_buffer + length, info.name, name_length);
+        length += name_length;
+    }
+    state->file_buffer[length] = '\0';
 
-    int32_t size = filesystem_get_file_size(FESK_DEMO_FILENAME);
+    if (length == 0) {
+        _fesk_demo_free_file_buffer(state);
+        return FESK_ERR_INVALID_ARGUMENT;
+    }
+
+    *out_text = state->file_buffer;
+    *out_length = length;
+    return FESK_OK;
+}
+
+// Like `cat <file>`: read the whole selected file so it can be transmitted.
+static fesk_result_t _fesk_demo_read_file(fesk_demo_state_t *state,
+                                          const char **out_text,
+                                          size_t *out_length) {
+    struct lfs_info info;
+    if (!_fesk_demo_get_file(state->file_index, &info)) {
+        return FESK_ERR_INVALID_ARGUMENT;
+    }
+
+    int32_t size = filesystem_get_file_size(info.name);
     if (size <= 0 || size > FESK_DEMO_MAX_FILE_SIZE) {
         return FESK_ERR_INVALID_ARGUMENT;
     }
@@ -96,7 +182,7 @@ static fesk_result_t _fesk_demo_provide_payload(const char **out_text,
     if (!state->file_buffer) {
         return FESK_ERR_ALLOCATION_FAILED;
     }
-    if (!filesystem_read_file(FESK_DEMO_FILENAME, state->file_buffer, size)) {
+    if (!filesystem_read_file(info.name, state->file_buffer, size)) {
         _fesk_demo_free_file_buffer(state);
         return FESK_ERR_INVALID_ARGUMENT;
     }
@@ -114,6 +200,25 @@ static fesk_result_t _fesk_demo_provide_payload(const char **out_text,
     *out_text = state->file_buffer;
     *out_length = (size_t)size;
     return FESK_OK;
+}
+
+static fesk_result_t _fesk_demo_provide_payload(const char **out_text,
+                                                size_t *out_length,
+                                                void *user_data) {
+    fesk_demo_state_t *state = (fesk_demo_state_t *)user_data;
+
+    _fesk_demo_free_file_buffer(state);
+
+    switch (state->mode) {
+        case FESK_DEMO_MODE_LS:
+            return _fesk_demo_build_ls(state, out_text, out_length);
+        case FESK_DEMO_MODE_FILE:
+            return _fesk_demo_read_file(state, out_text, out_length);
+        default:
+            *out_text = test_message;
+            *out_length = 0;
+            return FESK_OK;
+    }
 }
 
 static void _fesk_demo_on_ready(void *user_data) {
@@ -135,9 +240,12 @@ static void _fesk_demo_on_transmission_start(void *user_data) {
     fesk_demo_state_t *state = (fesk_demo_state_t *)user_data;
     if (!state) return;
 
-    const char *mode_name;
-    mode_name = state->mode == FESK_DEMO_MODE_FILE ? "FILE " FESK_DEMO_FILENAME : "TEST";
-    printf("Transmitting: %s\n", mode_name);
+    struct lfs_info info;
+    if (state->mode == FESK_DEMO_MODE_FILE && _fesk_demo_get_file(state->file_index, &info)) {
+        printf("Transmitting: FILE %s\n", info.name);
+    } else {
+        printf("Transmitting: %s\n", state->mode == FESK_DEMO_MODE_LS ? "LS" : "TEST");
+    }
 
     state->is_countdown = false;
     state->is_transmitting = true;
@@ -261,17 +369,22 @@ bool fesk_demo_face_loop(movement_event_t event, void *context) {
         case EVENT_LIGHT_LONG_PRESS:
             // Cycle between modes (what gets transmitted)
             if (!state->is_debug_playing && fesk_session_is_idle(&state->session)) {
-                state->mode = (state->mode + 1) % FESK_DEMO_MODE_COUNT;
+                _fesk_demo_next_mode(state);
                 _fesk_demo_display_ready(state);
             }
             handled = true;
             break;
 
         case EVENT_LIGHT_BUTTON_UP:
-            // Cycle between no LED, red, and green
             if (!state->is_debug_playing && fesk_session_is_idle(&state->session)) {
-                state->led_color = (state->led_color + 1) % 3;
-                state->session.config.static_message = test_message;
+                if (state->mode == FESK_DEMO_MODE_FILE) {
+                    _fesk_demo_next_file(state);
+                    _fesk_demo_display_ready(state);
+                } else {
+                    // Cycle between no LED, red, and green
+                    state->led_color = (state->led_color + 1) % 3;
+                    state->session.config.static_message = test_message;
+                }
             }
             handled = true;
             break;
@@ -289,7 +402,10 @@ bool fesk_demo_face_loop(movement_event_t event, void *context) {
                 break;
             }
             if (fesk_session_is_idle(&state->session)) {
-                if (state->mode == FESK_DEMO_MODE_FILE && !filesystem_file_exists(FESK_DEMO_FILENAME)) {
+                struct lfs_info info;
+                if (state->mode != FESK_DEMO_MODE_TEST && !_fesk_demo_get_file(
+                        state->mode == FESK_DEMO_MODE_FILE ? state->file_index : 0, &info)) {
+                    // The selected file is gone, or there are no files to list.
                     watch_display_text(WATCH_POSITION_BOTTOM, "NOFILE");
                 } else if (!state->is_countdown && !state->is_transmitting) {
                     fesk_session_start(&state->session);

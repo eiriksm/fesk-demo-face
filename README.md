@@ -3,7 +3,7 @@ A [Second Movement](https://github.com/joeycastillo/second-movement) watch face 
 
 ## Description
 
-Transmits either a built-in test message or the contents of the file `test` on the watch filesystem. Messages can be decoded with [fesk-rt](https://github.com/eiriksm/fesk-rt). See `src/fesk_demo_face.h` for the buttons.
+Transmits a built-in test message, a list of the files on the watch filesystem (like `ls`), or the contents of any one of those files (like `cat`). Messages can be decoded with [fesk-rt](https://github.com/eiriksm/fesk-rt). See `src/fesk_demo_face.h` for the buttons.
 
 ## Installation
 
