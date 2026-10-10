@@ -1,0 +1,5 @@
+{
+    "name": "eiriksm/fesk-demo-face",
+    "description": "Second Movement watch face that sends text as sound with FESK",
+    "license": "MIT"
+}
